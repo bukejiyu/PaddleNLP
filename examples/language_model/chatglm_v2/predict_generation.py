@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 import paddle
 from paddle.distributed import fleet
 
@@ -41,6 +42,17 @@ def batchfy_text(texts, batch_size):
         batch_start += batch_size
     return batch_texts
 
+def measure_time(func):
+    def wrapper(*args, **kwargs):
+        start_time = time.time()  # 记录函数开始执行的时间戳
+        result = func(*args, **kwargs)  # 执行原函数
+        end_time = time.time()  # 记录函数执行完毕的时间戳
+
+        execution_time = end_time - start_time
+        print(f"函数 {func.__name__} 的执行时间为: {execution_time} 秒")
+        return result
+
+    return wrapper
 
 class Predictor(object):
     def __init__(self, args=None, tokenizer=None, model=None, **kwargs):
@@ -95,7 +107,8 @@ class Predictor(object):
         for key in inputs:
             inputs_tensor[key] = paddle.to_tensor(inputs[key])
         return inputs_tensor
-
+    
+    @measure_time
     def infer(self, inputs):
         result = self.model.generate(
             **inputs,

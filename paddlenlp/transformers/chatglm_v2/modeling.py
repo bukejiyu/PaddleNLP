@@ -14,11 +14,12 @@
 
 import math
 from typing import Any, Dict, Optional, Tuple
+import numpy as np
 
 import paddle
 import paddle.nn as nn
 import paddle.nn.functional as F
-
+from custom_setup_ops import  write_cache_kv
 from .. import PretrainedModel, register_base_model
 from ..model_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
@@ -192,7 +193,7 @@ class CoreAttention(nn.Layer):
         # value_layer -> context layer.
         # [sk, b, np, hn] --> [b, np, sq, hn]
 
-        # context layer shape: [b, np, sq, hn]
+        # context layer shape: [b, np, sq, hn]de
         output_size = (value_layer.shape[1], value_layer.shape[2], query_layer.shape[0], value_layer.shape[3])
         # change view [sk, b * np, hn]
         value_layer = value_layer.reshape([value_layer.shape[0], output_size[0] * output_size[1], -1])
@@ -209,6 +210,128 @@ class CoreAttention(nn.Layer):
         context_layer = context_layer.reshape(new_context_shape)
 
         return context_layer
+
+def use_kernel(q,k,v,kv_cache,num_head,num_head_kv,dim_head,mode="mmha",cache_kvs=None):
+    #q 做完位置编码  [s_q,bz,num_head,head_dim]
+    #k 做完位置编码，seq=1 [s_kv,bz,num_head_kv,head_dim]
+    #v seq=1 [s_kv,bz,num_head_kv,head_dim]
+    #cache_k [seq,bz,num_head_kv,head_dim]
+    #cache_kv_mmha [2,bz,num_head_kv,seq,head_dim]
+    #output_size [seq,bz,num_head*dim_head]
+    output_size = (1, q.shape[1], q.shape[2]*q.shape[3])
+    q=q.squeeze(0)
+    k=k.squeeze(0)
+    v=v.squeeze(0)
+    bz=q.shape[0]
+    cache_k,cache_v=kv_cache
+    s_k=cache_k.shape[0]+1
+    src_mask=paddle.zeros([bz,1,1,s_k]).cast('float16')
+    seq_len=cache_k.shape[0]
+
+    if mode=="mqa":
+        from paddle.incubate.nn.functional.masked_multiquery_attention import masked_multiquery_attention
+        paddle_mqa_out = masked_multiquery_attention(
+                x=q,
+                kv_input= paddle.concat((k,v),axis=1),
+                bias=None,
+                src_mask=src_mask,
+                sequence_lengths=None,
+                rotary_tensor=None,
+                beam_cache_offset=None,
+                cache_kv=cache_kvs,
+                qkv_out_scale=None,
+                out_linear_shift=None,
+                out_linear_smooth=None,
+                beam_size=1,
+                rotary_emb_dims=0,
+                kv_split=True,
+                head_kv=num_head_kv,
+                mask_broadcast_num_heads=True,
+                compute_bias=False,
+                use_neox_rotary_style=False,        
+                )
+        paddle_mqa_out=paddle_mqa_out[0]
+        #paddle_mqa_out [bz,s_k,num_head,dim_head]
+        paddle_mqa_out = paddle_mqa_out.reshape(output_size)
+        paddle_mqa_out=paddle_mqa_out.transpose([1,0,2])
+        return paddle_mqa_out
+    elif mode=="mmha":
+        k = k.unsqueeze(-2)
+        k = k.tile(
+                    [ 1, 1, num_head // num_head_kv, 1]
+            )
+        k = k.reshape(
+                    k.shape[:1] + [num_head, dim_head]
+            )
+        v = v.unsqueeze(-2)
+        v = v.tile(
+                   [ 1, 1, num_head // num_head_kv, 1]
+                )
+        v = v.reshape(
+                    v.shape[:1] + [num_head, dim_head]
+            )
+        x = paddle.concat([q.unsqueeze(1).cast('float16'),k.unsqueeze(1).cast('float16'),v.unsqueeze(1).cast('float16')],axis=1).cast('float16')
+        cum_offsets=None
+        sequence_lengths=None
+        rotary_tensor=None
+        beam_cache_offset=None
+        qkv_out_scale=None
+        out_linear_shift=None
+        seq_len= seq_len
+        out_linear_in_scale= -1
+        rotary_emb_dims = 0
+        use_neox_rotary_style = False
+        quant_round_type=1
+        quant_max_bound=126
+        quant_min_bound=-126
+        #import pdb;pdb.set_trace()
+        # paddle_mmha_out = paddle._C_ops.masked_multihead_attention_(
+        #     x,
+        #     cache_kvs,
+        #     paddle.zeros([bz,num_head,dim_head],dtype=x.dtype),
+        #     src_mask,
+        #     cum_offsets,
+        #     sequence_lengths,
+        #     rotary_tensor,
+        #     beam_cache_offset,
+        #     qkv_out_scale,
+        #     out_linear_shift,
+        #     None,
+        #     seq_len,
+        #     rotary_emb_dims,
+        #     use_neox_rotary_style,
+        #     out_linear_in_scale,
+        #     quant_round_type,
+        #     quant_max_bound,
+        #     quant_min_bound,
+        # )
+        # paddle_mmha_out=paddle_mmha_out[0]
+        # paddle_mmha_out=paddle_mmha_out.unsqueeze(0)
+        # paddle_mmha_out=paddle_mmha_out.reshape(output_size)
+        from paddle.incubate.nn.functional.masked_multihead_attention import masked_multihead_attention
+        paddle_mmha_out=masked_multihead_attention(
+            x,
+            cache_kv=cache_kvs,
+            src_mask=src_mask,
+            cum_offsets=cum_offsets,
+            sequence_lengths=sequence_lengths,
+            rotary_tensor=rotary_tensor,
+            beam_cache_offset=beam_cache_offset,
+            qkv_out_scale=qkv_out_scale,
+            out_linear_shift=out_linear_shift,
+            out_linear_smooth=None,
+            seq_len=seq_len,
+            rotary_emb_dims=rotary_emb_dims,
+            use_neox_rotary_style=use_neox_rotary_style,
+            out_linear_in_scale=out_linear_in_scale,
+            quant_round_type=quant_round_type,
+            quant_max_bound=quant_max_bound,
+            quant_min_bound=quant_min_bound,
+        )
+        paddle_mmha_out=paddle_mmha_out[0]
+        paddle_mmha_out=paddle_mmha_out.unsqueeze(0)
+        paddle_mmha_out=paddle_mmha_out.reshape(output_size)
+        return paddle_mmha_out
 
 
 class SelfAttention(nn.Layer):
@@ -260,7 +383,7 @@ class SelfAttention(nn.Layer):
             device=device,
         )
 
-    def forward(self, hidden_states, attention_mask, rotary_pos_emb, kv_cache=None, use_cache=True):
+    def forward(self, hidden_states, attention_mask, rotary_pos_emb, kv_cache=None, use_cache=True, is_first_forward=True,usekernel=True,cache_kvs=None):
         # hidden_states: [seq_length, b, h]
 
         # =================================================
@@ -307,8 +430,11 @@ class SelfAttention(nn.Layer):
         if rotary_pos_emb is not None:
             query_layer = apply_rotary_pos_emb(query_layer, rotary_pos_emb)
             key_layer = apply_rotary_pos_emb(key_layer, rotary_pos_emb)
-
         # adjust key and value for inference
+
+        k_before_concat=key_layer
+        v_before_concat=value_layer
+
         if use_cache:
             if kv_cache is not None:
                 cache_k, cache_v = kv_cache
@@ -317,29 +443,62 @@ class SelfAttention(nn.Layer):
             kv_cache = (key_layer, value_layer)
         else:
             kv_cache = None
+        
+        #decoder阶段是传入的
+        k_before_tile=key_layer
+        v_before_tile=value_layer
 
-        if self.multi_query_attention:
-            key_layer = key_layer.unsqueeze(-2)
-            key_layer = key_layer.tile(
-                [1, 1, 1, self.num_attention_heads_per_partition // self.num_multi_query_groups_per_partition, 1]
-            )
-            key_layer = key_layer.reshape(
-                key_layer.shape[:2] + [self.num_attention_heads_per_partition, self.hidden_size_per_attention_head]
-            )
-            value_layer = value_layer.unsqueeze(-2)
-            value_layer = value_layer.tile(
-                [1, 1, 1, self.num_attention_heads_per_partition // self.num_multi_query_groups_per_partition, 1]
-            )
-            value_layer = value_layer.reshape(
-                value_layer.shape[:2] + [self.num_attention_heads_per_partition, self.hidden_size_per_attention_head]
-            )
+        mode="mmha"    
+        if not is_first_forward and usekernel:
+            #decoder 
+            context_layer=use_kernel(
+                q=query_layer,
+                k=k_before_concat,
+                v=v_before_concat,
+                kv_cache=kv_cache,
+                num_head=self.num_attention_heads_per_partition,
+                num_head_kv=self.num_multi_query_groups_per_partition,
+                dim_head=self.hidden_size_per_attention_head,
+                cache_kvs=cache_kvs,
+                mode=mode
+                )
+        elif not usekernel or is_first_forward or (not usekernel):    
+            if self.multi_query_attention:
+                key_layer = key_layer.unsqueeze(-2)
+                key_layer = key_layer.tile(
+                    [1, 1, 1, self.num_attention_heads_per_partition // self.num_multi_query_groups_per_partition, 1]
+                )
+                key_layer = key_layer.reshape(
+                    key_layer.shape[:2] + [self.num_attention_heads_per_partition, self.hidden_size_per_attention_head]
+                )
+                value_layer = value_layer.unsqueeze(-2)
+                value_layer = value_layer.tile(
+                    [1, 1, 1, self.num_attention_heads_per_partition // self.num_multi_query_groups_per_partition, 1]
+                )
+                value_layer = value_layer.reshape(
+                    value_layer.shape[:2] + [self.num_attention_heads_per_partition, self.hidden_size_per_attention_head]
+                )
 
-        # ==================================
-        # core attention computation
-        # ==================================
+            #做kernel的decoder   
+            if use_cache and usekernel and is_first_forward and mode == "mmha":
+                # decoder 阶段 需要tile后的k、v
+                #key_layer [s,bz,num_head,dim_head]
+                seq_lens=key_layer.shape[0]
+                k_out=key_layer.transpose([1,2,0,3]).cast('float16')
+                v_out=value_layer.transpose([1,2,0,3]).cast('float16')
+                write_cache_kv(k_out, v_out, cache_kvs, paddle.to_tensor([seq_lens]).cast("int32"))
+            elif use_cache and usekernel and is_first_forward and mode == "mqa":
+                seq_lens=k_before_tile.shape[0]
+                k_out=k_before_tile.transpose([1,2,0,3]).cast('float16')
+                v_out=v_before_tile.transpose([1,2,0,3]).cast('float16')
+                write_cache_kv(k_out, v_out, cache_kvs, paddle.to_tensor([seq_lens]).cast("int32"))
 
-        context_layer = self.core_attention(query_layer, key_layer, value_layer, attention_mask)
 
+            # ==================================
+            # core attention computation
+            # ==================================
+
+            context_layer = self.core_attention(query_layer, key_layer, value_layer, attention_mask)
         # =================
         # Output. [seq_length, b, h]
         # =================
@@ -421,6 +580,8 @@ class GLMBlock(nn.Layer):
         rotary_pos_emb,
         kv_cache=None,
         use_cache=True,
+        is_first_forward=True,
+        cache_kvs=None,
     ):
         # hidden_states: [s, b, h]
 
@@ -429,7 +590,7 @@ class GLMBlock(nn.Layer):
 
         # Self attention.
         attention_output, kv_cache = self.self_attention(
-            layernorm_output, attention_mask, rotary_pos_emb, kv_cache=kv_cache, use_cache=use_cache
+            layernorm_output, attention_mask, rotary_pos_emb, kv_cache=kv_cache, use_cache=use_cache,is_first_forward=is_first_forward,cache_kvs=cache_kvs
         )
 
         # Residual connection.
@@ -470,6 +631,12 @@ class GLMTransformer(nn.Layer):
 
         # Number of layers.
         self.num_hidden_layers = config.num_hidden_layers
+        
+        self.max_sequence_length = config.max_sequence_length
+        self.caches = []
+        self.head_dim = config.kv_channels * config.num_attention_heads//config.num_attention_heads
+        self.num_head = config.num_attention_heads
+        self.num_head_kv=config.multi_query_group_num
 
         # Transformer layers.
         def build_layer(layer_number):
@@ -493,9 +660,21 @@ class GLMTransformer(nn.Layer):
         kv_caches=None,
         use_cache: Optional[bool] = True,
         output_hidden_states: Optional[bool] = False,
+        is_first_forward: bool = True,
     ):
         if not kv_caches:
             kv_caches = [None for _ in range(self.num_hidden_layers)]
+        if len(self.caches) == 0:
+            paddle.set_default_dtype('float16')
+            bz=hidden_states.shape[1]
+            self.caches = [
+                    paddle.fluid.layers.fill_constant_batch_size_like(
+                        paddle.zeros([2, bz, self.num_head, self.max_sequence_length, self.head_dim]),
+                        shape=[2, -1, self.num_head, self.max_sequence_length, self.head_dim],
+                        input_dim_idx=0,
+                        output_dim_idx=1,
+                        value=0.,
+                        dtype=paddle.get_default_dtype())for _ in range(self.num_hidden_layers)]
         presents = () if use_cache else None
         all_self_attentions = None
         all_hidden_states = () if output_hidden_states else None
@@ -506,7 +685,7 @@ class GLMTransformer(nn.Layer):
             layer = self._get_layer(index)
 
             hidden_states, kv_cache = layer(
-                hidden_states, attention_mask, rotary_pos_emb, kv_cache=kv_caches[index], use_cache=use_cache
+                hidden_states, attention_mask, rotary_pos_emb, kv_cache=kv_caches[index], use_cache=use_cache,is_first_forward=is_first_forward,cache_kvs=self.caches[index]
             )
             if use_cache:
                 presents = presents + (kv_cache,)
@@ -611,6 +790,7 @@ class ChatGLMv2Model(ChatGLMv2PretrainedModel):
         output_hidden_states: Optional[bool] = None,
         # output_attentions: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        is_first_forward: bool = True,
     ):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -647,6 +827,7 @@ class ChatGLMv2Model(ChatGLMv2PretrainedModel):
             kv_caches=past_key_values,
             use_cache=use_cache,
             output_hidden_states=output_hidden_states,
+            is_first_forward=is_first_forward,
         )
 
         if not return_dict:
@@ -666,7 +847,6 @@ class ChatGLMv2ForConditionalGeneration(ChatGLMv2PretrainedModel):
 
         self.max_sequence_length = config.max_sequence_length
         self.chatglm_v2 = ChatGLMv2Model(config)
-
     def update_model_kwargs_for_generation(
         self,
         outputs: ModelOutput,
@@ -676,6 +856,7 @@ class ChatGLMv2ForConditionalGeneration(ChatGLMv2PretrainedModel):
     ) -> Dict[str, Any]:
         # update past_key_values
         model_kwargs["past_key_values"] = outputs[1] if isinstance(outputs, tuple) else outputs["past_key_values"]
+       # model_kwargs["caches"]=outputs[4] if isinstance(outputs, tuple) else outputs["caches"]
 
         # update attention mask
         if "attention_mask" in model_kwargs:
@@ -714,6 +895,7 @@ class ChatGLMv2ForConditionalGeneration(ChatGLMv2PretrainedModel):
             "position_ids": position_ids,
             "attention_mask": attention_mask,
             "return_last_logit": True,
+            "is_first_forward":is_first_forward,
         }
 
     def forward(
@@ -728,10 +910,10 @@ class ChatGLMv2ForConditionalGeneration(ChatGLMv2PretrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         return_last_logit: Optional[bool] = False,
+        is_first_forward: bool = True,
     ):
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
         transformer_outputs = self.chatglm_v2(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -741,6 +923,7 @@ class ChatGLMv2ForConditionalGeneration(ChatGLMv2PretrainedModel):
             use_cache=use_cache,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            is_first_forward=is_first_forward,
         )
 
         hidden_states = transformer_outputs[0]
