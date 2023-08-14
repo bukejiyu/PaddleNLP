@@ -20,6 +20,11 @@ import paddle
 import paddle.nn as nn
 import paddle.nn.functional as F
 from custom_setup_ops import  write_cache_kv
+USE_FLASH2 = True
+if USE_FLASH2:
+    from flash_atten2 import flash_attn_varlen_fwd
+else:
+    flash_attn_varlen_fwd = None
 from .. import PretrainedModel, register_base_model
 from ..model_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
@@ -111,7 +116,9 @@ class RMSNorm(nn.Layer):
         # if self.weight.dtype in [paddle.float16, paddle.bfloat16]:
         #     hidden_states = paddle.cast(hidden_states, self.weight.dtype)
         return output
-
+def save_tensor_to_txt(tensor, file_path):
+    np_array = tensor.numpy()  # Convert Paddle tensor to NumPy array
+    np.savetxt(file_path, np_array)  # Save the NumPy array to the text file
 
 class CoreAttention(nn.Layer):
     def __init__(self, config: ChatGLMv2Config, layer_number):
@@ -210,8 +217,110 @@ class CoreAttention(nn.Layer):
         context_layer = context_layer.reshape(new_context_shape)
 
         return context_layer
+def generate_qkv(q, k, v, query_padding_mask=None, key_padding_mask=None,
+    kvpacked=False, qkvpacked=False):
+    """
+    Arguments:
+        qkv: (batch_size, seqlen_q, 3, num_heads, head_size)
+        k: (batch_size, seqlen_k, nheads_k, d)
+        v: (batch_size, seqlen_k, nheads_k, d)
+        query_padding_mask: (batch_size, seqlen), bool/int
+        key_padding_mask: (batch_size, seqlen), bool/int
+    """
+    # print("q:", q.shape)
+    # print("k:", k.shape)
+    assert not (kvpacked and qkvpacked)
+    batch_size, seqlen_q, num_heads, head_size = q.shape
+    _, seqlen_k, nheads_k, _ = k.shape
+    assert k.shape == [batch_size, seqlen_k, nheads_k, head_size]
+    assert v.shape == [batch_size, seqlen_k, nheads_k, head_size]
+    if query_padding_mask is not None:
+        q_unpad, indices_q, cu_seqlens_q, max_seqlen_q = unpad_input(q, query_padding_mask)
+        output_pad_fn = lambda output_unpad: pad_input(output_unpad, indices_q, batch_size, seqlen_q, num_heads, head_size)
+    else:
+        q_unpad=q.reshape([q.shape[0]*q.shape[1],q.shape[2],q.shape[3]])
+        cu_seqlens_q=paddle.arange(0,(batch_size+1)*seqlen_q,step=seqlen_q,dtype=paddle.int32)
+        max_seqlen_q=paddle.to_tensor([seqlen_q])
+        output_pad_fn = lambda output_unpad:  output_unpad.reshape([batch_size,-1,output_unpad.shape[1],output_unpad.shape[2]])
+        
+    if key_padding_mask is not None:
+        k_unpad, indices_k, cu_seqlens_k, max_seqlen_k = unpad_input(k, key_padding_mask)
+        v_unpad, _, _, _ = unpad_input(v, key_padding_mask)
+    else:
+        k_unpad = k.reshape([k.shape[0]*k.shape[1],k.shape[2],k.shape[3]])
+        v_unpad = v.reshape([v.shape[0]*v.shape[1],v.shape[2],v.shape[3]])
+        cu_seqlens_k = paddle.arange(0, (batch_size + 1) * seqlen_k, step=seqlen_k, dtype=paddle.int32)
+        max_seqlen_k = paddle.to_tensor([seqlen_k])
 
-def use_kernel(q,k,v,kv_cache,num_head,num_head_kv,dim_head,mode="mmha",cache_kvs=None):
+    if (not qkvpacked) and (not kvpacked):
+        dq_pad_fn = output_pad_fn
+        if key_padding_mask is not None:
+            dk_pad_fn = lambda dk_unpad: pad_input(dk_unpad, indices_k, batch_size, seqlen_k, num_heads, head_size)
+        return (q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, q, k, v, output_pad_fn, None, None)
+
+def unpad_input(hidden_states, attention_mask):
+    """
+    Arguments:
+        hidden_states: (batch, seqlen, ...)
+        attention_mask: (batch, seqlen), bool / int, 1 means valid and 0 means not valid.
+    Return:
+        hidden_states: (total_nnz, ...), where total_nnz = number of tokens in selected in attention_mask.
+        cu_seqlens: (batch + 1), the cumulative sequence lengths, used to index into hidden_states.
+        max_seqlen_in_batch: int
+    """
+    seqlens_in_batch = paddle.sum(attention_mask, axis=-1, dtype="int32")
+    indices = paddle.flatten(paddle.nonzero(paddle.flatten(attention_mask.cast(paddle.int32)), as_tuple=False))
+    max_seqlen_in_batch = seqlens_in_batch.max()
+    cu_seqlens = F.pad(
+        paddle.cumsum(seqlens_in_batch, axis=0, dtype="int32"),
+        (1, 0))
+    
+    hidden_states = paddle.flatten(hidden_states, start_axis = 0, stop_axis = 1)
+    hidden_states_new = []
+    for i in indices:
+        hidden_states_new.append(hidden_states[i:i+1])
+    return (
+            paddle.concat(hidden_states_new), 
+            indices, cu_seqlens, max_seqlen_in_batch
+        )
+
+def pad_input(hidden_states, indices, batch, seqlen, num_heads, head_size):
+    """
+    Arguments:
+        hidden_states: (total_nnz, ...), where total_nnz = number of tokens in selected in attention_mask.
+        indices: (total_nnz)
+    Return:
+        hidden_states: (batch, seqlen, ...)
+    """
+    output = paddle.zeros([batch * seqlen, num_heads, head_size], dtype=hidden_states.dtype)
+    # output[indices] = hidden_states
+    for i in range(indices.size):
+        output[indices[i]] = hidden_states[i]
+    return output.reshape([batch, seqlen, num_heads, head_size])
+
+
+def use_kernel_encoder(query_layer,key_layer,value_layer,num_head,num_head_kv,dim_head,cache_kvs=None,attention_mask=None):
+    from flash_atten2 import flash_attn_varlen_fwd
+    q_ = query_layer.transpose([1, 0, 2, 3])
+    k_ = key_layer.transpose([1, 0, 2, 3])
+    v_ = value_layer.transpose([1, 0, 2, 3])
+    (q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, q, k, v,
+                output_pad_fn, _, _) = generate_qkv(
+                    q_,
+                    k_,
+                    v_,
+                    attention_mask,
+                    attention_mask,
+                    )
+    scale = float(dim_head ** -0.5)
+    zero_tensors = False
+    is_causal = True
+    fmha_out = flash_attn_varlen_fwd(q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, scale, zero_tensors, is_causal)
+    fmha_out = output_pad_fn(fmha_out)
+    fmha_out = fmha_out.transpose([1,0,2,3])
+    fmha_out =fmha_out.reshape([fmha_out.shape[0],fmha_out.shape[1],fmha_out.shape[2]*fmha_out.shape[3]])
+    return fmha_out
+def use_kernel_decoder(q,k,v,kv_cache,num_head,num_head_kv,dim_head,mode="mqa",cache_kvs=None):
     #q 做完位置编码  [s_q,bz,num_head,head_dim]
     #k 做完位置编码，seq=1 [s_kv,bz,num_head_kv,head_dim]
     #v seq=1 [s_kv,bz,num_head_kv,head_dim]
@@ -224,36 +333,39 @@ def use_kernel(q,k,v,kv_cache,num_head,num_head_kv,dim_head,mode="mmha",cache_kv
     v=v.squeeze(0)
     bz=q.shape[0]
     cache_k,cache_v=kv_cache
-    s_k=cache_k.shape[0]+1
-    src_mask=paddle.zeros([bz,1,1,s_k]).cast('float16')
-    seq_len=cache_k.shape[0]
-
+    seq_before_concat=cache_k.shape[0]+1
+    src_mask=paddle.zeros([bz,1,1,seq_before_concat]).cast('float16')
+    seq_len=seq_before_concat-1
+    cache_kv_out=paddle.concat((cache_k.unsqueeze(0).transpose([0,2,3,1,4]), cache_v.unsqueeze(0).transpose([0,2,3,1,4])), axis=0).cast('float16')
+    #x=paddle.concat((q, k, v), axis=1).cast('float16')
     if mode=="mqa":
         from paddle.incubate.nn.functional.masked_multiquery_attention import masked_multiquery_attention
+        # save_tensor_to_txt(q.reshape([q.shape[0]*q.shape[1],q.shape[2]]),"/workspace/test_logs/data_input/q_input.txt")
+        # save_tensor_to_txt(k.reshape([k.shape[0]*k.shape[1],k.shape[2]]),"/workspace/test_logs/data_input/k_input.txt")
+        # save_tensor_to_txt(v.reshape([v.shape[0]*v.shape[1],v.shape[2]]),"/workspace/test_logs/data_input/v_input.txt")
+        # save_tensor_to_txt(cache_k.reshape([cache_k.shape[0]*cache_k.shape[1]*cache_k.shape[2],cache_k.shape[3]]),"/workspace/test_logs/data_input/cache_k.txt")
+        # save_tensor_to_txt(cache_v.reshape([cache_v.shape[0]*cache_v.shape[1]*cache_v.shape[2],cache_v.shape[3]]),"/workspace/test_logs/data_input/cache_v.txt")
+        # save_tensor_to_txt(cache_kvs.reshape([cache_kvs.shape[0]*cache_kvs.shape[1]*cache_kvs.shape[2]*cache_kvs.shape[3],cache_kvs.shape[4]]),"/workspace/test_logs/data_input/cache_kv.txt")
         paddle_mqa_out = masked_multiquery_attention(
                 x=q,
+                cache_kv=cache_kvs,
                 kv_input= paddle.concat((k,v),axis=1),
-                bias=None,
                 src_mask=src_mask,
                 sequence_lengths=None,
                 rotary_tensor=None,
                 beam_cache_offset=None,
-                cache_kv=cache_kvs,
                 qkv_out_scale=None,
                 out_linear_shift=None,
                 out_linear_smooth=None,
-                beam_size=1,
+                seq_len=seq_len,
                 rotary_emb_dims=0,
                 kv_split=True,
                 head_kv=num_head_kv,
-                mask_broadcast_num_heads=True,
-                compute_bias=False,
                 use_neox_rotary_style=False,        
                 )
         paddle_mqa_out=paddle_mqa_out[0]
-        #paddle_mqa_out [bz,s_k,num_head,dim_head]
+        paddle_mqa_out=paddle_mqa_out.transpose([1,0,2,3])
         paddle_mqa_out = paddle_mqa_out.reshape(output_size)
-        paddle_mqa_out=paddle_mqa_out.transpose([1,0,2])
         return paddle_mqa_out
     elif mode=="mmha":
         k = k.unsqueeze(-2)
@@ -284,54 +396,98 @@ def use_kernel(q,k,v,kv_cache,num_head,num_head_kv,dim_head,mode="mmha",cache_kv
         quant_round_type=1
         quant_max_bound=126
         quant_min_bound=-126
-        #import pdb;pdb.set_trace()
-        # paddle_mmha_out = paddle._C_ops.masked_multihead_attention_(
-        #     x,
-        #     cache_kvs,
-        #     paddle.zeros([bz,num_head,dim_head],dtype=x.dtype),
-        #     src_mask,
-        #     cum_offsets,
-        #     sequence_lengths,
-        #     rotary_tensor,
-        #     beam_cache_offset,
-        #     qkv_out_scale,
-        #     out_linear_shift,
-        #     None,
-        #     seq_len,
-        #     rotary_emb_dims,
-        #     use_neox_rotary_style,
-        #     out_linear_in_scale,
-        #     quant_round_type,
-        #     quant_max_bound,
-        #     quant_min_bound,
-        # )
-        # paddle_mmha_out=paddle_mmha_out[0]
-        # paddle_mmha_out=paddle_mmha_out.unsqueeze(0)
-        # paddle_mmha_out=paddle_mmha_out.reshape(output_size)
-        from paddle.incubate.nn.functional.masked_multihead_attention import masked_multihead_attention
-        paddle_mmha_out=masked_multihead_attention(
+        paddle_mmha_out = paddle._C_ops.masked_multihead_attention_(
             x,
-            cache_kv=cache_kvs,
-            src_mask=src_mask,
-            cum_offsets=cum_offsets,
-            sequence_lengths=sequence_lengths,
-            rotary_tensor=rotary_tensor,
-            beam_cache_offset=beam_cache_offset,
-            qkv_out_scale=qkv_out_scale,
-            out_linear_shift=out_linear_shift,
-            out_linear_smooth=None,
-            seq_len=seq_len,
-            rotary_emb_dims=rotary_emb_dims,
-            use_neox_rotary_style=use_neox_rotary_style,
-            out_linear_in_scale=out_linear_in_scale,
-            quant_round_type=quant_round_type,
-            quant_max_bound=quant_max_bound,
-            quant_min_bound=quant_min_bound,
+            cache_kvs,
+            paddle.zeros([bz,num_head,dim_head],dtype=x.dtype),
+            src_mask,
+            cum_offsets,
+            sequence_lengths,
+            rotary_tensor,
+            beam_cache_offset,
+            qkv_out_scale,
+            out_linear_shift,
+            None,
+            seq_len,
+            rotary_emb_dims,
+            use_neox_rotary_style,
+            out_linear_in_scale,
+            quant_round_type,
+            quant_max_bound,
+            quant_min_bound,
         )
         paddle_mmha_out=paddle_mmha_out[0]
         paddle_mmha_out=paddle_mmha_out.unsqueeze(0)
         paddle_mmha_out=paddle_mmha_out.reshape(output_size)
+        # from paddle.incubate.nn.functional.masked_multihead_attention import masked_multihead_attention
+        # paddle_mmha_out=masked_multihead_attention(
+        #     x,
+        #     cache_kv=cache_kvs,
+        #     src_mask=src_mask,
+        #     cum_offsets=cum_offsets,
+        #     sequence_lengths=sequence_lengths,
+        #     rotary_tensor=rotary_tensor,
+        #     beam_cache_offset=beam_cache_offset,
+        #     qkv_out_scale=qkv_out_scale,
+        #     out_linear_shift=out_linear_shift,
+        #     out_linear_smooth=None,
+        #     seq_len=seq_len,
+        #     rotary_emb_dims=rotary_emb_dims,
+        #     use_neox_rotary_style=use_neox_rotary_style,
+        #     out_linear_in_scale=out_linear_in_scale,
+        #     quant_round_type=quant_round_type,
+        #     quant_max_bound=quant_max_bound,
+        #     quant_min_bound=quant_min_bound,
+        # )
+        # paddle_mmha_out=paddle_mmha_out[0]
+        # paddle_mmha_out=paddle_mmha_out.unsqueeze(0)
+        # paddle_mmha_out=paddle_mmha_out.reshape(output_size)
         return paddle_mmha_out
+    elif "navie":
+        cache_k, cache_v = paddle.split(cache_kv_out, 2, axis=0)
+        k = paddle.to_tensor(np.expand_dims(k, axis=2))
+        v = paddle.to_tensor(np.expand_dims(v, axis=2))
+        q = paddle.to_tensor(np.expand_dims(q, axis=2))
+        k = paddle.concat([cache_k.squeeze(0), k], axis=2)
+        v = paddle.concat([cache_v.squeeze(0), v], axis=2)
+        for i in range(num_head):
+            if(i<16):
+                tmp = paddle.matmul(
+                    x=q[:, i, :, :] * (dim_head**-0.5),
+                    y=k[:, 0, :, :],
+                    transpose_y=True,
+                )  
+            else:
+                tmp = paddle.matmul(
+                    x=q[:, i, :, :] * (dim_head**-0.5),
+                    y=k[:, 1, :, :],
+                    transpose_y=True,
+                ) 
+            if i == 0:
+                product = tmp
+            else:
+                product = np.concatenate((product, tmp), axis=1)
+        product = np.expand_dims(product, axis=2)
+        product = product + src_mask
+
+        product = paddle.nn.functional.softmax(product)
+        for i in range(num_head):
+            if(i<16):
+                tmp = paddle.matmul(
+                    product[:, i, :, :], v[:, 0, :, :]
+                )
+            else:
+                tmp = paddle.matmul(
+                    product[:, i, :, :], v[:, 1, :, :]
+                )
+            if i == 0:
+                out = tmp
+            else:
+                out = np.concatenate((out, tmp), axis=1)
+        out = np.expand_dims(out, axis=1)
+        out=out.reshape(output_size)
+        return out
+
 
 
 class SelfAttention(nn.Layer):
@@ -434,7 +590,7 @@ class SelfAttention(nn.Layer):
 
         k_before_concat=key_layer
         v_before_concat=value_layer
-
+        kv_cache_before_concat=kv_cache
         if use_cache:
             if kv_cache is not None:
                 cache_k, cache_v = kv_cache
@@ -444,25 +600,48 @@ class SelfAttention(nn.Layer):
         else:
             kv_cache = None
         
-        #decoder阶段是传入的
-        k_before_tile=key_layer
-        v_before_tile=value_layer
+        #encoder使用
+        k_after_tile=key_layer
+        v_after_tile=value_layer
+        #[mqa,mmhq,navie]
+        mode="mqa"
+        usekernel=True    
+        if is_first_forward and usekernel:
+            #query_layer[seq_l,batch_size,num_head,head_dim]
+            #encoder
+            #cache_kv
+            dim_head=query_layer.shape[3]
+            num_head=query_layer.shape[2]
+            num_head_kv=key_layer.shape[2]
+            seq_lens=key_layer.shape[0]
+            k_out=key_layer.transpose([1,2,0,3]).cast('float16')
+            v_out=value_layer.transpose([1,2,0,3]).cast('float16')
+            write_cache_kv(k_out, v_out, cache_kvs, paddle.to_tensor([seq_lens]).cast("int32"))
+            context_layer=use_kernel_encoder(
+                query_layer=query_layer,
+                key_layer=key_layer,
+                value_layer=value_layer,
+                num_head=num_head,
+                num_head_kv=num_head_kv,
+                dim_head=dim_head,
+                cache_kvs=cache_kvs,
+                attention_mask=attention_mask,
+            )
 
-        mode="mmha"    
-        if not is_first_forward and usekernel:
+        elif not is_first_forward and usekernel:
             #decoder 
-            context_layer=use_kernel(
+            context_layer=use_kernel_decoder(
                 q=query_layer,
                 k=k_before_concat,
                 v=v_before_concat,
-                kv_cache=kv_cache,
+                kv_cache=kv_cache_before_concat,
                 num_head=self.num_attention_heads_per_partition,
                 num_head_kv=self.num_multi_query_groups_per_partition,
                 dim_head=self.hidden_size_per_attention_head,
                 cache_kvs=cache_kvs,
                 mode=mode
                 )
-        elif not usekernel or is_first_forward or (not usekernel):    
+        elif not usekernel :    
             if self.multi_query_attention:
                 key_layer = key_layer.unsqueeze(-2)
                 key_layer = key_layer.tile(
@@ -487,17 +666,12 @@ class SelfAttention(nn.Layer):
                 k_out=key_layer.transpose([1,2,0,3]).cast('float16')
                 v_out=value_layer.transpose([1,2,0,3]).cast('float16')
                 write_cache_kv(k_out, v_out, cache_kvs, paddle.to_tensor([seq_lens]).cast("int32"))
-            elif use_cache and usekernel and is_first_forward and mode == "mqa":
-                seq_lens=k_before_tile.shape[0]
-                k_out=k_before_tile.transpose([1,2,0,3]).cast('float16')
-                v_out=v_before_tile.transpose([1,2,0,3]).cast('float16')
-                write_cache_kv(k_out, v_out, cache_kvs, paddle.to_tensor([seq_lens]).cast("int32"))
 
 
             # ==================================
             # core attention computation
             # ==================================
-
+            #import pdb;pdb.set_trace()
             context_layer = self.core_attention(query_layer, key_layer, value_layer, attention_mask)
         # =================
         # Output. [seq_length, b, h]
@@ -662,15 +836,15 @@ class GLMTransformer(nn.Layer):
         output_hidden_states: Optional[bool] = False,
         is_first_forward: bool = True,
     ):
+        #print(self.max_sequence_length)
         if not kv_caches:
             kv_caches = [None for _ in range(self.num_hidden_layers)]
         if len(self.caches) == 0:
             paddle.set_default_dtype('float16')
-            bz=hidden_states.shape[1]
             self.caches = [
                     paddle.fluid.layers.fill_constant_batch_size_like(
-                        paddle.zeros([2, bz, self.num_head, self.max_sequence_length, self.head_dim]),
-                        shape=[2, -1, self.num_head, self.max_sequence_length, self.head_dim],
+                        paddle.zeros([2, 1, self.num_head_kv, self.max_sequence_length, self.head_dim]),
+                        shape=[2, -1, self.num_head_kv, self.max_sequence_length, self.head_dim],
                         input_dim_idx=0,
                         output_dim_idx=1,
                         value=0.,
@@ -809,7 +983,7 @@ class ChatGLMv2Model(ChatGLMv2PretrainedModel):
                 past_key_values and seq_length != 1
             ):
                 full_attention_mask = self.get_masks(input_ids, past_key_values, padding_mask=attention_mask)
-
+        #import pdb;pdb.set_trace()
         # Rotary positional embeddings
         rotary_pos_emb = self.rotary_pos_emb(self.max_sequence_length)
         if position_ids is not None:
@@ -945,7 +1119,6 @@ class ChatGLMv2ForConditionalGeneration(ChatGLMv2PretrainedModel):
 
             lm_logits = lm_logits.astype(hidden_states.dtype)
             loss = loss.astype(hidden_states.dtype)
-
         if not return_dict:
             output = (lm_logits,) + transformer_outputs[1:]
             return ((loss,) + output) if loss is not None else output

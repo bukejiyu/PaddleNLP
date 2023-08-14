@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import time
+import numpy as np
 import paddle
 from paddle.distributed import fleet
 
@@ -28,9 +29,9 @@ def parse_arguments():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name_or_path", default="THUDM/chatglm2-6b", help="The directory of model.")
-    parser.add_argument("--batch_size", type=int, default=1, help="The batch size of data.")
-    parser.add_argument("--src_length", type=int, default=128, help="The batch size of data.")
-    parser.add_argument("--tgt_length", type=int, default=128, help="The batch size of data.")
+    parser.add_argument("--batch_size", type=int, default=4, help="The batch size of data.")
+    parser.add_argument("--src_length", type=int, default=1024, help="The batch size of data.")
+    parser.add_argument("--tgt_length", type=int, default=1024, help="The batch size of data.")
     return parser.parse_args()
 
 
@@ -103,6 +104,7 @@ class Predictor(object):
             truncation=True,
             truncation_side="left",
         )
+        #import pdb;pdb.set_trace()
         inputs_tensor = {}
         for key in inputs:
             inputs_tensor[key] = paddle.to_tensor(inputs[key])
@@ -110,16 +112,28 @@ class Predictor(object):
     
     @measure_time
     def infer(self, inputs):
-        result = self.model.generate(
-            **inputs,
-            decode_strategy="sampling",
-            top_k=1,
-            max_length=self.tgt_length,
-            bos_token_id=self.tokenizer.bos_token_id,
-            eos_token_id=self.tokenizer.eos_token_id,
-            pad_token_id=self.tokenizer.pad_token_id,
-            use_cache=True,
-        )
+        count=10
+        all_time=[]
+        while count>0:
+            start_time=time.time()
+            result = self.model.generate(
+                **inputs,
+                decode_strategy="sampling",
+                top_k=1,
+                max_length=self.tgt_length,
+                min_length=self.tgt_length,
+                bos_token_id=self.tokenizer.bos_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.tokenizer.pad_token_id,
+                use_cache=True,
+            )
+            paddle.device.cuda.synchronize()
+            end_time=time.time()
+            all_time.append(end_time-start_time)
+            count=count-1
+        #eos_token_id=self.tokenizer.eos_token_id
+        print(all_time)
+        print("平均时间",np.mean(all_time[2:]))
         result = result[0]
         return result
 
@@ -143,11 +157,10 @@ if __name__ == "__main__":
     args = parse_arguments()
     predictor = Predictor(args)
     all_texts = [
-        "你好",
-        "[Round 0]\n问：你好\n答：你好👋!我是人工智能助手 ChatGLM-6B,很高兴见到你,欢迎问我任何问题。\n[Round 1]\n问：晚上睡不着应该怎么办\n答：",
-    ]
+        "你好"*1024,
+    ]*4
     batch_texts = batchfy_text(all_texts, args.batch_size)
     for bs, texts in enumerate(batch_texts):
         outputs = predictor.predict(texts)
-        for text, result in zip(texts, outputs["result"]):
-            print("{}\n{}".format(text, result))
+        # for text, result in zip(texts, outputs["result"]):
+        #     print("{}\n{}".format(text, result))

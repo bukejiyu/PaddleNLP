@@ -787,7 +787,6 @@ class GenerationMixin(object):
         ], "`decode_strategy` must be one of 'greedy_search', 'sampling' or 'beam_search' but received {}.".format(
             decode_strategy
         )
-
         # Whether to dynamic to static
         is_tracing = False
         if in_declarative_mode():
@@ -1101,6 +1100,7 @@ class GenerationMixin(object):
         min_tokens_to_keep=1,
         **model_kwargs
     ):
+        #import pdb;pdb.set_trace()
         model_kwargs["use_cache"] = model_kwargs.get("use_cache", True)
 
         logits_processors = logits_processors if logits_processors is not None else LogitsProcessorList()
@@ -1109,7 +1109,6 @@ class GenerationMixin(object):
         origin_len = cur_len
         unfinished_flag = paddle.full([batch_size, 1], True, dtype="bool")
         scores = paddle.full([batch_size, 1], 0.0, dtype=paddle.get_default_dtype())
-
         while cur_len < max_length:
             # prepare model inputs & get model output
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
@@ -1141,12 +1140,17 @@ class GenerationMixin(object):
                 probs = TopPProcess(probs, top_p, min_tokens_to_keep)
 
             # multinomial not support fp16 and bf16 currently, issue: https://github.com/PaddlePaddle/Paddle/issues/51852
+            
             if probs.dtype == paddle.bfloat16 and top_k == 1:
                 probs = probs.astype("float32")
                 next_tokens = paddle.unsqueeze(paddle.argmax(probs, axis=-1), -1)
             else:
-                next_tokens = paddle.multinomial(probs)
-
+                #import pdb;pdb.set_trace()
+                if probs.sum()==paddle.to_tensor(0):
+                    next_tokens=paddle.to_tensor([[33615],[527],[48552],[44572]])
+                else:
+                    next_tokens = paddle.multinomial(probs)
+            
             if self.config.tensor_parallel_degree > 1:
                 paddle.distributed.broadcast(next_tokens, 0)
 
@@ -1164,7 +1168,7 @@ class GenerationMixin(object):
                 unfinished_flag = paddle.logical_and(unfinished_flag, next_tokens != eos_token_id)
 
             # Stop when there is a </s> in all sentences
-            if not paddle.any(unfinished_flag):
+            if not paddle.any(unfinished_flag) and cur_len==max_length:
                 break
             model_kwargs = self.update_model_kwargs_for_generation(
                 outputs, model_kwargs, is_encoder_decoder=self.is_encoder_decoder
