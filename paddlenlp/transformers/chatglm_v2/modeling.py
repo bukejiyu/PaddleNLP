@@ -309,8 +309,8 @@ def use_kernel_encoder(query_layer,key_layer,value_layer,num_head,num_head_kv,di
                     q_,
                     k_,
                     v_,
-                    attention_mask,
-                    attention_mask,
+                    None,
+                    None,
                     )
     scale = float(dim_head ** -0.5)
     zero_tensors = False

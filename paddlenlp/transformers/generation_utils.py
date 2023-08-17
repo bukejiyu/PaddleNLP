@@ -1145,11 +1145,7 @@ class GenerationMixin(object):
                 probs = probs.astype("float32")
                 next_tokens = paddle.unsqueeze(paddle.argmax(probs, axis=-1), -1)
             else:
-                #import pdb;pdb.set_trace()
-                if probs.sum()==paddle.to_tensor(0):
-                    next_tokens=paddle.to_tensor([[33615],[527],[48552],[44572]])
-                else:
-                    next_tokens = paddle.multinomial(probs)
+                next_tokens = paddle.multinomial(probs)
             
             if self.config.tensor_parallel_degree > 1:
                 paddle.distributed.broadcast(next_tokens, 0)
@@ -1168,7 +1164,7 @@ class GenerationMixin(object):
                 unfinished_flag = paddle.logical_and(unfinished_flag, next_tokens != eos_token_id)
 
             # Stop when there is a </s> in all sentences
-            if not paddle.any(unfinished_flag) and cur_len==max_length:
+            if not paddle.any(unfinished_flag):
                 break
             model_kwargs = self.update_model_kwargs_for_generation(
                 outputs, model_kwargs, is_encoder_decoder=self.is_encoder_decoder
