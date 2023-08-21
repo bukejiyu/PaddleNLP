@@ -20,12 +20,14 @@ import paddle
 import paddle.nn as nn
 import paddle.nn.functional as F
 from custom_setup_ops import  write_cache_kv
-USE_FLASH2 = True
-if USE_FLASH2:
-    from flash_atten2 import flash_attn_varlen_fwd
-else:
-    flash_attn_varlen_fwd = None
-from .. import PretrainedModel, register_base_model
+from paddle.nn.functional.flash_attention import flash_attn_unpadded
+
+# USE_FLASH2 = True
+# if USE_FLASH2:
+#     from flash_atten2 import flash_attn_varlen_fwd
+# else:
+#     flash_attn_varlen_fwd = None
+# from .. import PretrainedModel, register_base_model
 from ..model_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     CausalLMOutputWithPast,
@@ -299,27 +301,49 @@ def pad_input(hidden_states, indices, batch, seqlen, num_heads, head_size):
     return output.reshape([batch, seqlen, num_heads, head_size])
 
 
-def use_kernel_encoder(query_layer,key_layer,value_layer,num_head,num_head_kv,dim_head,cache_kvs=None,attention_mask=None):
-    from flash_atten2 import flash_attn_varlen_fwd
-    q_ = query_layer.transpose([1, 0, 2, 3])
-    k_ = key_layer.transpose([1, 0, 2, 3])
-    v_ = value_layer.transpose([1, 0, 2, 3])
-    (q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, q, k, v,
-                output_pad_fn, _, _) = generate_qkv(
-                    q_,
-                    k_,
-                    v_,
-                    None,
-                    None,
-                    )
-    scale = float(dim_head ** -0.5)
-    zero_tensors = False
-    is_causal = True
-    fmha_out = flash_attn_varlen_fwd(q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, scale, zero_tensors, is_causal)
-    fmha_out = output_pad_fn(fmha_out)
-    fmha_out = fmha_out.transpose([1,0,2,3])
-    fmha_out =fmha_out.reshape([fmha_out.shape[0],fmha_out.shape[1],fmha_out.shape[2]*fmha_out.shape[3]])
-    return fmha_out
+def use_kernel_encoder(query_layer,key_layer,value_layer,num_head,num_head_kv,dim_head,attention_mask=None):
+    #仅定长
+    bs = query_layer.shape[1]
+    qs = query_layer.shape[0]
+    kvs = key_layer.shape[0]
+    scale = 1.0 / paddle.sqrt(dim_head)
+    cu_q = paddle.arange(0, (bs + 1) * qs, qs, dtype='int32')
+    cu_kv = paddle.arange(0, (bs + 1) * kvs, kvs, dtype='int32')
+    qq = paddle.reshape(query_layer, [bs * qs, num_head, dim_head])
+    kk = paddle.reshape(key_layer, [bs * kvs, num_head_kv, dim_head])
+    vv = paddle.reshape(value_layer, [bs * kvs, num_head_kv, dim_head])
+    out=flash_attn_unpadded(
+        query=qq,
+        key=kk,
+        value=vv,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_kv,
+        max_seqlen_q=qs,
+        max_seqlen_k=kvs,
+        scale=scale,
+    )
+    out = out.transpose([1,0,2,3])
+    out = out.reshape([qs,bs,num_head*dim_head])
+    # from flash_atten2 import flash_attn_varlen_fwd
+    # q_ = query_layer.transpose([1, 0, 2, 3])
+    # k_ = key_layer.transpose([1, 0, 2, 3])
+    # v_ = value_layer.transpose([1, 0, 2, 3])
+    # (q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, q, k, v,
+    #             output_pad_fn, _, _) = generate_qkv(
+    #                 q_,
+    #                 k_,
+    #                 v_,
+    #                 None,
+    #                 None,
+    #                 )
+    # scale = float(dim_head ** -0.5)
+    # zero_tensors = False
+    # is_causal = True
+    # fmha_out = flash_attn_varlen_fwd(q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, scale, zero_tensors, is_causal)
+    # fmha_out = output_pad_fn(fmha_out)
+    # fmha_out = fmha_out.transpose([1,0,2,3])
+    # fmha_out =fmha_out.reshape([fmha_out.shape[0],fmha_out.shape[1],fmha_out.shape[2]*fmha_out.shape[3]])
+    return out
 def use_kernel_decoder(q,k,v,kv_cache,num_head,num_head_kv,dim_head,mode="mqa",cache_kvs=None):
     #q 做完位置编码  [s_q,bz,num_head,head_dim]
     #k 做完位置编码，seq=1 [s_kv,bz,num_head_kv,head_dim]
@@ -327,7 +351,7 @@ def use_kernel_decoder(q,k,v,kv_cache,num_head,num_head_kv,dim_head,mode="mqa",c
     #cache_k [seq,bz,num_head_kv,head_dim]
     #cache_kv_mmha [2,bz,num_head_kv,seq,head_dim]
     #output_size [seq,bz,num_head*dim_head]
-    output_size = (1, q.shape[1], q.shape[2]*q.shape[3])
+    output_size = (1, q.shape[2]*q.shape[3])
     q=q.squeeze(0)
     k=k.squeeze(0)
     v=v.squeeze(0)
@@ -346,25 +370,25 @@ def use_kernel_decoder(q,k,v,kv_cache,num_head,num_head_kv,dim_head,mode="mqa",c
         # save_tensor_to_txt(cache_k.reshape([cache_k.shape[0]*cache_k.shape[1]*cache_k.shape[2],cache_k.shape[3]]),"/workspace/test_logs/data_input/cache_k.txt")
         # save_tensor_to_txt(cache_v.reshape([cache_v.shape[0]*cache_v.shape[1]*cache_v.shape[2],cache_v.shape[3]]),"/workspace/test_logs/data_input/cache_v.txt")
         # save_tensor_to_txt(cache_kvs.reshape([cache_kvs.shape[0]*cache_kvs.shape[1]*cache_kvs.shape[2]*cache_kvs.shape[3],cache_kvs.shape[4]]),"/workspace/test_logs/data_input/cache_kv.txt")
+        #import pdb;pdb.set_trace()
         paddle_mqa_out = masked_multiquery_attention(
-                x=q,
+                query=q,
+                key=k,
+                value=v,
                 cache_kv=cache_kvs,
-                kv_input= paddle.concat((k,v),axis=1),
                 src_mask=src_mask,
+                cum_offsets=None,
                 sequence_lengths=None,
                 rotary_tensor=None,
                 beam_cache_offset=None,
-                qkv_out_scale=None,
-                out_linear_shift=None,
-                out_linear_smooth=None,
+                out_shift=None,
+                out_smooth=None,
                 seq_len=seq_len,
                 rotary_emb_dims=0,
-                kv_split=True,
                 head_kv=num_head_kv,
-                use_neox_rotary_style=False,        
+                use_neox_rotary_style=False,       
                 )
         paddle_mqa_out=paddle_mqa_out[0]
-        paddle_mqa_out=paddle_mqa_out.transpose([1,0,2,3])
         paddle_mqa_out = paddle_mqa_out.reshape(output_size)
         return paddle_mqa_out
     elif mode=="mmha":
@@ -842,13 +866,16 @@ class GLMTransformer(nn.Layer):
         if len(self.caches) == 0:
             paddle.set_default_dtype('float16')
             self.caches = [
-                    paddle.fluid.layers.fill_constant_batch_size_like(
-                        paddle.zeros([2, 1, self.num_head_kv, self.max_sequence_length, self.head_dim]),
-                        shape=[2, -1, self.num_head_kv, self.max_sequence_length, self.head_dim],
-                        input_dim_idx=0,
-                        output_dim_idx=1,
-                        value=0.,
-                        dtype=paddle.get_default_dtype())for _ in range(self.num_hidden_layers)]
+                        paddle.zeros(shape=[2, 1, self.num_head_kv, self.max_sequence_length, self.head_dim],dtype=paddle.get_default_dtype())
+                        for _ in range(self.num_hidden_layers)]
+            # self.caches = [
+            #         paddle.fluid.layers.fill_constant_batch_size_like(
+            #             paddle.zeros([2, 1, self.num_head_kv, self.max_sequence_length, self.head_dim]),
+            #             shape=[2, -1, self.num_head_kv, self.max_sequence_length, self.head_dim],
+            #             input_dim_idx=0,
+            #             output_dim_idx=1,
+            #             value=0.,
+            #             dtype=paddle.get_default_dtype())for _ in range(self.num_hidden_layers)]
         presents = () if use_cache else None
         all_self_attentions = None
         all_hidden_states = () if output_hidden_states else None
