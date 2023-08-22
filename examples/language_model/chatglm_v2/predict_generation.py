@@ -113,7 +113,7 @@ class Predictor(object):
     
     @measure_time
     def infer(self, inputs):
-        count=50
+        count=1
         all_time=[]
         while count>0:
             start_time=time.time()

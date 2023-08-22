@@ -20,14 +20,13 @@ import paddle
 import paddle.nn as nn
 import paddle.nn.functional as F
 from custom_setup_ops import  write_cache_kv
-from paddle.nn.functional.flash_attention import flash_attn_unpadded
 
 # USE_FLASH2 = True
 # if USE_FLASH2:
 #     from flash_atten2 import flash_attn_varlen_fwd
 # else:
 #     flash_attn_varlen_fwd = None
-# from .. import PretrainedModel, register_base_model
+from .. import PretrainedModel, register_base_model
 from ..model_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     CausalLMOutputWithPast,
@@ -301,49 +300,65 @@ def pad_input(hidden_states, indices, batch, seqlen, num_heads, head_size):
     return output.reshape([batch, seqlen, num_heads, head_size])
 
 
-def use_kernel_encoder(query_layer,key_layer,value_layer,num_head,num_head_kv,dim_head,attention_mask=None):
+def use_kernel_encoder(query_layer,key_layer,value_layer,num_head,num_head_kv,dim_head,cur_seq):
     #仅定长
+    # bs = query_layer.shape[1]
+    # qs = query_layer.shape[0]
+    # kvs = key_layer.shape[0]
+    # scale = float(dim_head ** -0.5)
+    # cu_q = paddle.arange(0, (bs + 1) * qs, qs, dtype='int32')
+    # cu_kv = paddle.arange(0, (bs + 1) * kvs, kvs, dtype='int32')
+    # query_layer = query_layer.transpose([1, 0, 2, 3])
+    # key_layer = key_layer.transpose([1, 0, 2, 3])
+    # value_layer = value_layer.transpose([1, 0, 2, 3])
+    # qq = paddle.reshape(query_layer, [bs * qs, num_head, dim_head])
+    # kk = paddle.reshape(key_layer, [bs * kvs, num_head_kv, dim_head])
+    # vv = paddle.reshape(value_layer, [bs * kvs, num_head_kv, dim_head])
+    # from  paddle.nn.functional.flash_attention import flash_attn_unpadded
+    # out,_=flash_attn_unpadded(
+    #     query=qq,
+    #     key=kk,
+    #     value=vv,
+    #     cu_seqlens_q=cu_q,
+    #     cu_seqlens_k=cu_kv,
+    #     max_seqlen_q=qs,
+    #     max_seqlen_k=kvs,
+    #     scale=scale,
+    # )
+    # #import pdb;pdb.set_trace()
+    # out = out.reshape([bs,-1,num_head,dim_head])
+    # out = out.transpose([1,0,2,3])
+    # out = out.reshape([qs,bs,num_head*dim_head])
+    # return out
+    from flash_atten2 import flash_attn_varlen_fwd
     bs = query_layer.shape[1]
     qs = query_layer.shape[0]
     kvs = key_layer.shape[0]
-    scale = 1.0 / paddle.sqrt(dim_head)
     cu_q = paddle.arange(0, (bs + 1) * qs, qs, dtype='int32')
     cu_kv = paddle.arange(0, (bs + 1) * kvs, kvs, dtype='int32')
+    query_layer = query_layer.transpose([1, 0, 2, 3])
+    key_layer = key_layer.transpose([1, 0, 2, 3])
+    value_layer = value_layer.transpose([1, 0, 2, 3])
     qq = paddle.reshape(query_layer, [bs * qs, num_head, dim_head])
     kk = paddle.reshape(key_layer, [bs * kvs, num_head_kv, dim_head])
     vv = paddle.reshape(value_layer, [bs * kvs, num_head_kv, dim_head])
-    out=flash_attn_unpadded(
-        query=qq,
-        key=kk,
-        value=vv,
-        cu_seqlens_q=cu_q,
-        cu_seqlens_k=cu_kv,
-        max_seqlen_q=qs,
-        max_seqlen_k=kvs,
-        scale=scale,
-    )
-    out = out.transpose([1,0,2,3])
-    out = out.reshape([qs,bs,num_head*dim_head])
-    # from flash_atten2 import flash_attn_varlen_fwd
-    # q_ = query_layer.transpose([1, 0, 2, 3])
-    # k_ = key_layer.transpose([1, 0, 2, 3])
-    # v_ = value_layer.transpose([1, 0, 2, 3])
-    # (q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, q, k, v,
-    #             output_pad_fn, _, _) = generate_qkv(
-    #                 q_,
-    #                 k_,
-    #                 v_,
-    #                 None,
-    #                 None,
-    #                 )
-    # scale = float(dim_head ** -0.5)
-    # zero_tensors = False
-    # is_causal = True
-    # fmha_out = flash_attn_varlen_fwd(q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, scale, zero_tensors, is_causal)
-    # fmha_out = output_pad_fn(fmha_out)
-    # fmha_out = fmha_out.transpose([1,0,2,3])
-    # fmha_out =fmha_out.reshape([fmha_out.shape[0],fmha_out.shape[1],fmha_out.shape[2]*fmha_out.shape[3]])
-    return out
+    scale = float(dim_head ** -0.5)
+    zero_tensors = False
+    is_causal = True
+    fmha_out = flash_attn_varlen_fwd(
+        qq,
+        kk, 
+        vv, 
+        cu_q,
+        cu_kv, 
+        paddle.to_tensor([cur_seq]),
+        paddle.to_tensor([cur_seq]), 
+        scale, zero_tensors, 
+        is_causal)
+    fmha_out = fmha_out.reshape([bs,-1,num_head,dim_head])
+    fmha_out = fmha_out.transpose([1,0,2,3])
+    fmha_out =fmha_out.reshape([fmha_out.shape[0],fmha_out.shape[1],fmha_out.shape[2]*fmha_out.shape[3]])
+    return fmha_out
 def use_kernel_decoder(q,k,v,kv_cache,num_head,num_head_kv,dim_head,mode="mqa",cache_kvs=None):
     #q 做完位置编码  [s_q,bz,num_head,head_dim]
     #k 做完位置编码，seq=1 [s_kv,bz,num_head_kv,head_dim]
@@ -648,8 +663,7 @@ class SelfAttention(nn.Layer):
                 num_head=num_head,
                 num_head_kv=num_head_kv,
                 dim_head=dim_head,
-                cache_kvs=cache_kvs,
-                attention_mask=attention_mask,
+                cur_seq=seq_lens
             )
 
         elif not is_first_forward and usekernel:
