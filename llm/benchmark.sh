@@ -25,12 +25,23 @@ export FLAGS_cache_inference_while_scope=1
 
 
 python predictor.py \
-    --model_name_or_path ./llama7b-inference_model_fp16 \
-    --dtype float16 \
-    --src_length 300 \
-    --max_length 100 \
-    --output_file "infer.json" \
-    --mode "static" \
+    --model_name_or_path ./meta-llama/Llama-2-7b-chat \
+    --dtype float32 \
+    --src_length 128 \
+    --max_length 15 \
     --batch_size 1 \
-    --benchmark \
+    --mode "dynamic"\
+    --benchmark False\
+    --device "cpu"\
     --inference_model 
+
+# python predictor.py \
+#     --model_name_or_path ./llama7b-inference_model_fp16 \
+#     --dtype float32 \
+#     --src_length 300 \
+#     --max_length 100 \
+#     --output_file "infer.json" \
+#     --mode "static" \
+#     --batch_size 1 \
+#     --benchmark \
+#     --inference_model 

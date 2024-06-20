@@ -36,6 +36,7 @@ from paddlenlp.experimental.transformers.fused_transformer_layers import (
     FusedMultiTransformerBase,
     FusedMultiTransformerConfig,
     FusedMultiTransformerWeightOnly,
+    FusedMultiTransformerCPU,
 )
 from paddlenlp.experimental.transformers.generation_utils import (
     GenerationBlockInferenceModel,
@@ -82,6 +83,506 @@ class FusedLlamaRMSNorm(nn.Layer):
             return result[0]
         return result
 
+@register_base_model
+class LlamaCpuInferenceModel(LlamaPretrainedModel):
+    """
+    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`LlamaDecoderLayer`]
+    Args:
+        config: LlamaConfig
+    """
+
+    def __init__(self, config: LlamaConfig):
+        super().__init__(config)
+        self.vocab_size = config.vocab_size
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+        self.intermediate_size = config.intermediate_size
+        self.num_layers = config.num_hidden_layers
+        self.epsilon = config.rms_norm_eps
+        self.max_position_embeddings = config.max_position_embeddings
+        #根据config.quant_type 转换成 cpu对应的权重 目前仅支持fp16/bf16（较好的cpu上）
+        #后续支持wint8/w8a8 等
+        self.quant_type = config.quant_type
+        self.embed_tokens = nn.Embedding(
+            self.vocab_size,
+            self.hidden_size,
+        )
+        ln_scale_attrs = [paddle.ParamAttr(name="fusellama.{}.ln_scale".format(i)) for i in range(self.num_layers)]
+        qkv_weight_attrs = [
+            paddle.ParamAttr(
+                name="fusellama.{}.qkv_weight".format(i), initializer=paddle.nn.initializer.Constant(value=0)
+            )
+            for i in range(self.num_layers)
+        ]
+        out_proj_weight_attrs = [
+            paddle.ParamAttr(
+                name="fusellama.{}.out_proj_weight".format(i), initializer=paddle.nn.initializer.Constant(value=0)
+            )
+            for i in range(self.num_layers)
+        ]
+        ffn_ln_scale_attrs = [
+            paddle.ParamAttr(name="fusellama.{}.ffn_ln_scale".format(i)) for i in range(self.num_layers)
+        ]
+        ffn1_weight_attrs = [
+            paddle.ParamAttr(
+                name="fusellama.{}.ffn1_weight".format(i), initializer=paddle.nn.initializer.Constant(value=0)
+            )
+            for i in range(self.num_layers)
+        ]
+        ffn2_weight_attrs = [
+            paddle.ParamAttr(
+                name="fusellama.{}.ffn2_weight".format(i), initializer=paddle.nn.initializer.Constant(value=0)
+            )
+            for i in range(self.num_layers)
+        ]
+
+        transformer_config = FusedMultiTransformerConfig(
+            self.hidden_size,
+            self.num_attention_heads,
+            self.intermediate_size,
+            activation="swiglu",
+            num_layers=config.num_hidden_layers,
+            ln_scale_attrs=ln_scale_attrs,
+            qkv_weight_attrs=qkv_weight_attrs,
+            linear_weight_attrs=out_proj_weight_attrs,
+            ffn_ln_scale_attrs=ffn_ln_scale_attrs,
+            ffn1_weight_attrs=ffn1_weight_attrs,
+            ffn2_weight_attrs=ffn2_weight_attrs,
+            epsilon=self.epsilon,
+            norm_type="rmsnorm",
+        )
+
+        self.set_transformer_block(transformer_config)
+        self.norm = FusedLlamaRMSNorm(config)
+
+    def set_transformer_block(self, transformer_config):
+        self.transformer_block = FusedMultiTransformerCPU(transformer_config)
+
+    def remove_padding(self, input_ids, seq_lens_this_time):
+        pass
+
+    # This function is a little different from prepare_input_ids_for_generation in paddlenlp/transformers/generation/utils.py
+    @staticmethod
+    def prepare_input_ids_for_generation(bos_token_id, encoder_output=None):
+        batch_size = 1
+        seq_len = 1
+        if bos_token_id is None:
+            raise ValueError("`bos_token_id` should be defined when no " "`input_ids` are provided.")
+        if encoder_output is not None:
+            batch_size = encoder_output.shape[0]
+            seq_len = encoder_output.shape[1]
+        return paddle.ones([batch_size, seq_len], dtype="int64") * bos_token_id
+
+    def forward(
+        self,
+        input_ids=None,
+        position_ids=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        past_seq_len=0,
+        cur_seq_len=0,
+        cur_step=0,
+        output_hidden_states=None,
+        return_dict=False,
+        **kwargs,
+    ):
+        # kwargs["cache"] is used used to distinguish between encoder and decoder phase.
+        is_decoder = past_seq_len==0
+
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+        elif input_ids is None and inputs_embeds is None:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+        # genereate a fake input_ids according to inputs_embeds
+        # this is usually occurred in img2txt multimodal model when first enter into this forward function.
+        if input_ids is None and inputs_embeds is not None:
+            input_ids = self.prepare_input_ids_for_generation(self.config.bos_token_id, inputs_embeds)
+        if inputs_embeds is not None:
+            batch, seq_len, hidden_dim = inputs_embeds.shape
+            # merge batch and seq_len dimension.
+            inputs_embeds = inputs_embeds.reshape([batch * seq_len, hidden_dim])
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids.squeeze(axis=1))
+
+        hidden_states = inputs_embeds
+
+        # decoder layers
+        all_hidden_states = () if output_hidden_states else None
+
+
+        theta = 10000.0
+
+        with dy2st_nocheck_guard_context():
+            hidden_states, _ = self.transformer_block(
+                input_ids,
+                hidden_states,
+                attn_mask=paddle.cast(attention_mask, dtype=hidden_states.dtype),
+                position_ids=position_ids,
+                past_seq_len=past_seq_len,
+                cur_seq_len=cur_seq_len,
+                cur_step=cur_step,
+            )
+        hidden_states = self.norm(hidden_states)
+
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+
+        if not return_dict:
+            return tuple(v for v in [hidden_states, None, all_hidden_states, None] if v is not None)
+
+        return BaseModelOutputWithPastAndCrossAttentions(
+            last_hidden_state=hidden_states,
+            past_key_values=None,
+            hidden_states=all_hidden_states,
+            attentions=None,
+        )
+
+    @paddle.no_grad()
+    def set_state_dict(self, state_dict):
+        unfused_state_dict = {}
+        head_size = self.hidden_size // self.num_attention_heads
+        split_fn = split_param_func()
+
+        self.embed_tokens.weight.set_value(
+            paddle.to_tensor(state_dict["llama.embed_tokens.weight"]).cast(self.embed_tokens.weight.dtype)
+        )
+        self.norm.weight.set_value(paddle.to_tensor(state_dict["llama.norm.weight"]).cast(self.norm.weight.dtype))
+
+        for idx in range(self.config.num_hidden_layers):
+            logger.info(f"set state for layer {idx}")
+
+            if self.use_weight_only:
+                logger.info("weight only is enabled")
+            if "llama.layers.{}.self_attn.qkv_proj.weight".format(idx) in state_dict.keys():
+                concated_qkv_weight = np.concatenate(
+                    split_fn(
+                        state_dict["llama.layers.{}.self_attn.qkv_proj.weight".format(idx)],
+                        is_qkv=True,
+                        num_heads=self.num_attention_heads // self.config.tensor_parallel_degree,
+                        num_key_value_heads=self.num_attention_heads // self.config.tensor_parallel_degree,
+                    ),
+                    axis=-1,
+                ).transpose(1, 0)
+            else:
+                unfused_state_dict = {}
+                unfused_state_dict["self_attn.q_proj.weight"] = state_dict[
+                    "llama.layers.{}.self_attn.q_proj.weight".format(idx)
+                ]
+                unfused_state_dict["self_attn.k_proj.weight"] = state_dict[
+                    "llama.layers.{}.self_attn.k_proj.weight".format(idx)
+                ]
+                unfused_state_dict["self_attn.v_proj.weight"] = state_dict[
+                    "llama.layers.{}.self_attn.v_proj.weight".format(idx)
+                ]
+                concated_qkv_weight = (
+                    np.concatenate(
+                        [
+                            unfused_state_dict["self_attn.q_proj.weight"],
+                            unfused_state_dict["self_attn.k_proj.weight"],
+                            unfused_state_dict["self_attn.v_proj.weight"],
+                        ],
+                        axis=-1,
+                    )
+                    .transpose(1, 0)
+                    .reshape(
+                        3 * (self.num_attention_heads // self.config.tensor_parallel_degree) * (head_size),
+                        self.hidden_size,
+                    )
+                )  # reshape(3, self.num_attention_heself.hidden_sizeads // self.config.tensor_parallel_degree, head_size, )
+            if "llama.layers.{}.mlp.gate_up_fused_proj.weight".format(idx) in state_dict.keys():
+                concated_ffn1_weight = np.concatenate(
+                    split_fn(state_dict["llama.layers.{}.mlp.gate_up_fused_proj.weight".format(idx)]), axis=-1
+                )
+            else:
+                unfused_state_dict["mlp.gate_proj.weight"] = state_dict[
+                    "llama.layers.{}.mlp.gate_proj.weight".format(idx)
+                ]
+                unfused_state_dict["mlp.up_proj.weight"] = state_dict["llama.layers.{}.mlp.up_proj.weight".format(idx)]
+                concated_ffn1_weight = np.concatenate(
+                    [unfused_state_dict["mlp.gate_proj.weight"], unfused_state_dict["mlp.up_proj.weight"]], axis=-1
+                )
+            ffn1_weight_tensor = paddle.to_tensor(concated_ffn1_weight)
+
+            qkv_weight_tensor = paddle.to_tensor(concated_qkv_weight)
+            if self.use_weight_only:
+                qkv_weight_tensor = paddle.to_tensor(concated_qkv_weight)
+                qkv_weight_tensor = paddle.transpose(qkv_weight_tensor, perm=[1, 0])
+                qkv_quanted_weight_tensor, qkv_weight_scale_tensor = weight_quantize(
+                    qkv_weight_tensor.cuda(), algo=self.quant_type
+                )
+                qkv_quanted_weight_tensor = qkv_quanted_weight_tensor.cpu()
+                qkv_weight_scale_tensor = qkv_weight_scale_tensor.cpu()
+                qkv_weight_scale_tensor = qkv_weight_scale_tensor.cast(qkv_weight_tensor.dtype)
+                self.transformer_block.qkv_weights[idx].set_value(qkv_quanted_weight_tensor)
+                self.transformer_block.qkv_weights_scale[idx].set_value(qkv_weight_scale_tensor)
+            elif self.quant_type == "a8w8":
+                self.transformer_block.qkv_weights[idx].set_value(
+                    paddle.cast(paddle.to_tensor(concated_qkv_weight), "int8")
+                )
+            else:
+                self.transformer_block.qkv_weights[idx].set_value(
+                    qkv_weight_tensor.cast(self.transformer_block.qkv_weights[idx].dtype)
+                )
+
+            linear_weight_tensor = paddle.to_tensor(state_dict["llama.layers.{}.self_attn.o_proj.weight".format(idx)])
+            if self.use_weight_only:
+                linear_quanted_weight_tensor, linear_weight_scale_tensor = weight_quantize(
+                    linear_weight_tensor.cuda(), algo=self.quant_type
+                )
+                linear_quanted_weight_tensor = linear_quanted_weight_tensor.cpu()
+                linear_weight_scale_tensor = linear_weight_scale_tensor.cpu()
+                linear_weight_scale_tensor = linear_weight_scale_tensor.cast(linear_weight_tensor.dtype)
+                self.transformer_block.linear_weights[idx].set_value(linear_quanted_weight_tensor)
+                self.transformer_block.linear_weights_scale[idx].set_value(linear_weight_scale_tensor)
+            elif self.quant_type == "a8w8":
+                self.transformer_block.linear_weights[idx].set_value(
+                    paddle.cast(
+                        paddle.to_tensor(state_dict["llama.layers.{}.self_attn.o_proj.weight".format(idx)]).transpose(
+                            (1, 0)
+                        ),
+                        "int8",
+                    )
+                )
+            else:
+                self.transformer_block.linear_weights[idx].set_value(
+                    linear_weight_tensor.cast(self.transformer_block.linear_weights[idx].dtype)
+                )
+
+            if self.use_weight_only:
+                ffn1_quanted_weight_tensor, ffn1_weight_scale_tensor = weight_quantize(
+                    ffn1_weight_tensor.cuda(), algo=self.quant_type
+                )
+                ffn1_quanted_weight_tensor = ffn1_quanted_weight_tensor.cpu()
+                ffn1_weight_scale_tensor = ffn1_weight_scale_tensor.cpu()
+                ffn1_weight_scale_tensor = ffn1_weight_scale_tensor.cast(ffn1_weight_tensor.dtype)
+                self.transformer_block.ffn1_weights[idx].set_value(ffn1_quanted_weight_tensor)
+                self.transformer_block.ffn1_weights_scale[idx].set_value(ffn1_weight_scale_tensor)
+            elif self.quant_type == "a8w8":
+                self.transformer_block.ffn1_weights[idx].set_value(
+                    paddle.cast(paddle.to_tensor(concated_ffn1_weight).transpose((1, 0)), "int8")
+                )
+            else:
+                self.transformer_block.ffn1_weights[idx].set_value(
+                    ffn1_weight_tensor.cast(self.transformer_block.ffn1_weights[idx].dtype)
+                )
+
+            ffn2_weight_tensor = paddle.to_tensor(state_dict["llama.layers.{}.mlp.down_proj.weight".format(idx)])
+            if self.use_weight_only:
+                ffn2_quanted_weight_tensor, ffn2_weight_scale_tensor = weight_quantize(
+                    ffn2_weight_tensor.cuda(), algo=self.quant_type
+                )
+                ffn2_quanted_weight_tensor = ffn2_quanted_weight_tensor.cpu()
+                ffn2_weight_scale_tensor = ffn2_weight_scale_tensor.cpu()
+                ffn2_weight_scale_tensor = ffn2_weight_scale_tensor.cast(ffn2_weight_tensor.dtype)
+                self.transformer_block.ffn2_weights[idx].set_value(ffn2_quanted_weight_tensor)
+                self.transformer_block.ffn2_weights_scale[idx].set_value(ffn2_weight_scale_tensor)
+            elif self.quant_type == "a8w8":
+                self.transformer_block.ffn2_weights[idx].set_value(
+                    paddle.cast(
+                        paddle.to_tensor(state_dict["llama.layers.{}.mlp.down_proj.weight".format(idx)]).transpose(
+                            (1, 0)
+                        ),
+                        "int8",
+                    )
+                )
+            else:
+                self.transformer_block.ffn2_weights[idx].set_value(
+                    ffn2_weight_tensor.cast(self.transformer_block.ffn2_weights[idx].dtype)
+                )
+
+            if self.quant_type == "a8w8":
+                if self.shift_smooth_all_linears:
+                    self.transformer_block.linear_shifts[idx].set_value(
+                        paddle.to_tensor(state_dict["llama.layers.{}.self_attn.o_proj.shift_bias".format(idx)])
+                    )
+                    self.transformer_block.linear_smooths[idx].set_value(
+                        paddle.to_tensor(state_dict["llama.layers.{}.self_attn.o_proj.smooth_weight".format(idx)])
+                    )
+                    self.transformer_block.ffn2_shifts[idx].set_value(
+                        paddle.to_tensor(state_dict["llama.layers.{}.mlp.down_proj.shift_bias".format(idx)])
+                    )
+                    self.transformer_block.ffn2_smooths[idx].set_value(
+                        paddle.to_tensor(state_dict["llama.layers.{}.mlp.down_proj.smooth_weight".format(idx)])
+                    )
+
+                if self.shift:
+                    self.transformer_block.ln_biases[idx].set_value(
+                        paddle.to_tensor(state_dict["llama.layers.{}.input_layernorm.bias".format(idx)])
+                    )
+                    self.transformer_block.ffn_ln_biases[idx].set_value(
+                        paddle.to_tensor(state_dict["llama.layers.{}.post_attention_layernorm.bias".format(idx)])
+                    )
+
+                    unfused_state_dict["self_attn.q_proj.bias"] = state_dict[
+                        "llama.layers.{}.self_attn.q_proj.bias".format(idx)
+                    ]
+                    unfused_state_dict["self_attn.k_proj.bias"] = state_dict[
+                        "llama.layers.{}.self_attn.k_proj.bias".format(idx)
+                    ]
+                    unfused_state_dict["self_attn.v_proj.bias"] = state_dict[
+                        "llama.layers.{}.self_attn.v_proj.bias".format(idx)
+                    ]
+
+                    concated_qkv_biases = np.concatenate(
+                        [
+                            unfused_state_dict["self_attn.q_proj.bias"],
+                            unfused_state_dict["self_attn.k_proj.bias"],
+                            unfused_state_dict["self_attn.v_proj.bias"],
+                        ],
+                        axis=-1,
+                    )
+
+                    self.transformer_block.qkv_biases[idx].set_value(paddle.to_tensor(concated_qkv_biases))
+
+                    unfused_state_dict["mlp.gate_proj.bias"] = state_dict[
+                        "llama.layers.{}.mlp.gate_proj.bias".format(idx)
+                    ]
+                    unfused_state_dict["mlp.up_proj.bias"] = state_dict["llama.layers.{}.mlp.up_proj.bias".format(idx)]
+
+                    concated_ffn1_bias = np.concatenate(
+                        [unfused_state_dict["mlp.gate_proj.bias"], unfused_state_dict["mlp.up_proj.bias"]], axis=-1
+                    )
+
+                    self.transformer_block.ffn1_biases[idx].set_value(paddle.to_tensor(concated_ffn1_bias))
+
+                    if self.shift_smooth_all_linears:
+                        self.transformer_block.linear_biases[idx].set_value(
+                            paddle.to_tensor(state_dict["llama.layers.{}.self_attn.o_proj.bias".format(idx)])
+                        )
+                        self.transformer_block.ffn2_biases[idx].set_value(
+                            paddle.to_tensor(state_dict["llama.layers.{}.mlp.down_proj.layer.bias".format(idx)])
+                        )
+
+            self.transformer_block.ln_scales[idx].set_value(
+                paddle.to_tensor(state_dict["llama.layers.{}.input_layernorm.weight".format(idx)]).cast(
+                    self.transformer_block.ln_scales[idx].dtype
+                )
+            )
+
+            self.transformer_block.ffn_ln_scales[idx].set_value(
+                paddle.to_tensor(state_dict["llama.layers.{}.post_attention_layernorm.weight".format(idx)]).cast(
+                    self.transformer_block.ffn_ln_scales[idx].dtype
+                )
+            )
+
+        if self.quant_type == "a8w8":
+            current_work_dir = os.path.dirname(__file__)
+            scale_map_file = (
+                f"{current_work_dir}/ptq_scales_map.json"
+                if not self.shift_smooth_all_linears
+                else f"{current_work_dir}/ptq_scales_map_shift_smooth.json"
+            )
+
+            with open(scale_map_file) as json_file:
+                scale_map_dict = json.load(json_file)
+                act_scale_map_dict = scale_map_dict["act_scale"]
+                weight_scale_map_dict = scale_map_dict["weight_scale"]
+                cache_scale_map_dict = scale_map_dict["cachekv_scale"]
+                # TODO(RichardWooSJTU): support multi-cards
+
+                act_scale_json_path = os.path.join(self.quant_model_path, "act_scales.json")
+                weight_scale_json_path = os.path.join(self.quant_model_path, "weight_scales.json")
+                if self.config.tensor_parallel_degree > 1 and not self.config.single_card_ptq:
+                    act_scale_json_path = os.path.join(
+                        self.quant_model_path, f"act_scales_{self.config.tensor_parallel_rank}.json"
+                    )
+                    weight_scale_json_path = os.path.join(
+                        self.quant_model_path, f"weight_scales_{self.config.tensor_parallel_rank}.json"
+                    )
+                act_scale_loader = ActScalesLoader(
+                    act_scale_json_path, act_scale_map_dict, num_of_layers=self.config.num_hidden_layers
+                )
+                self.transformer_block.act_scales = act_scale_loader.scale
+
+                weight_scales_loader = WeightScalesLoader(
+                    weight_scale_json_path,
+                    weight_scale_map_dict,
+                    num_of_layers=self.config.num_hidden_layers,
+                    concat_qkv=True,
+                    concat_ffn1=True,
+                )
+
+                if self.config.use_cachekv_int8 == "static":
+                    cache_scale_json_path = os.path.join(self.quant_model_path, "cachekv_act_scales.json")
+                    if self.config.tensor_parallel_degree > 1 and not self.config.single_card_ptq:
+                        cache_scale_json_path = os.path.join(
+                            self.quant_model_path, f"cachekv_act_scales_{self.config.tensor_parallel_rank}.json"
+                        )
+                    cache_scales_loader = CacheScaleLoader(
+                        cache_scale_json_path,
+                        cache_scale_map_dict,
+                        num_of_layers=self.config.num_hidden_layers,
+                        num_heads=self.num_attention_heads // self.config.tensor_parallel_degree,
+                    )
+                    for k, v in cache_scales_loader.scale.items():
+                        for i_layer, weight_scale in enumerate(v):
+                            weight_scale = weight_scale.astype("float32")
+                            if k == "cache_k_scale":
+                                self.transformer_block.cache_k_scales[i_layer].set_value(weight_scale)
+                            elif k == "cache_v_scale":
+                                self.transformer_block.cache_v_scales[i_layer].set_value(weight_scale)
+                            elif k == "cache_k_out_scale":
+                                self.transformer_block.cache_k_out_scales[i_layer].set_value(weight_scale)
+                            else:
+                                self.transformer_block.cache_v_out_scales[i_layer].set_value(weight_scale)
+
+                for k, v in weight_scales_loader.scale.items():
+                    if "qkv_" in k:
+                        for i_layer, weight_scale in enumerate(v):
+                            tmp = paddle.to_tensor(
+                                weight_scale
+                                / (
+                                    127.0 * 127.0 * act_scale_loader.scale["qkv_in_scale"][i_layer]
+                                )  # [3 * num_head * dim_head]
+                            ).reshape([-1])
+
+                            if self.config.tensor_parallel_degree > 1 and self.config.single_card_ptq:
+                                tmp = (
+                                    tmp.reshape([3, self.num_attention_heads, head_size])
+                                    .split(self.config.tensor_parallel_degree, axis=1)[
+                                        self.config.tensor_parallel_rank
+                                    ]
+                                    .reshape([-1])
+                                )
+                            self.transformer_block.qkv_out_scales[i_layer].set_value(tmp)
+                        pass
+                    elif "out_linear_" in k:
+                        for i_layer, weight_scale in enumerate(v):
+                            tmp = paddle.to_tensor(
+                                weight_scale / (127.0 * 127.0 * act_scale_loader.scale["out_linear_in_scale"][i_layer])
+                            )
+                            self.transformer_block.linear_out_scales[i_layer].set_value(tmp)
+                    elif "ffn1_weight_scale" in k:
+                        for i_layer, weight_scale in enumerate(v):
+                            tmp = paddle.to_tensor(
+                                weight_scale / (127.0 * 127.0 * act_scale_loader.scale["ffn1_in_scale"][i_layer])
+                            )
+                            if self.config.tensor_parallel_degree > 1 and self.config.single_card_ptq:
+                                tmp = paddle.split(tmp, self.config.tensor_parallel_degree * 2)
+                                tmp = paddle.concat(
+                                    [
+                                        tmp[self.config.tensor_parallel_rank],
+                                        tmp[self.config.tensor_parallel_rank + self.config.tensor_parallel_degree],
+                                    ],
+                                    axis=0,
+                                )
+                            self.transformer_block.ffn1_out_scales[i_layer].set_value(tmp)
+                    elif "ffn2" in k:
+                        for i_layer, weight_scale in enumerate(v):
+                            self.transformer_block.ffn2_out_scales[i_layer].set_value(
+                                paddle.to_tensor(
+                                    weight_scale / (127.0 * 127.0 * act_scale_loader.scale["ffn2_in_scale"][i_layer])
+                                )
+                            )
 
 @register_base_model
 class LlamaInferenceModel(LlamaPretrainedModel):
@@ -877,6 +1378,128 @@ class LlamaBlockInferenceModel(LlamaInferenceModel):
             hidden_states=None,
             attentions=None,
         )
+
+class LlamaForCausalLMCpuInferenceModel(GenerationCpuInferenceModel, LlamaPretrainedModel):
+
+    _keys_to_ignore_on_load_missing = [r"lm_head.weight"]
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.llama = LlamaCpuInferenceModel(config)
+        self.lm_head = LlamaLMHead(config)
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
+        # TODO: Support safetensors loading.
+        kwargs["use_safetensors"] = False
+        return super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+
+    @classmethod
+    def get_cache_kvs_shape(
+        cls, config: LlamaConfig, max_batch_size: int = None, max_length: int = None
+    ) -> list[list[int]]:
+        return []
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        cache_kvs,
+        seq_len_encoder,
+        seq_len_decoder,
+        tgt_ids,
+        tgt_pos,
+        tgt_generation_mask,
+        **kwargs,
+    ):
+        seq_len_encoder = kwargs.get("seq_len_encoder", None)
+        seq_len_decoder = kwargs.get("seq_len_decoder", None)
+        inputs_embeds = kwargs.get("inputs_embeds", None)
+        step_idx=kwargs.get("step_idx",None)
+        past_output_len=seq_len_decoder-seq_len_encoder
+        past_seq_len = 0 if past_output_len==0 else seq_len_decoder-past_output_len-1
+        #decoder
+        if past_seq_len!=0:
+            # make inputs_embeds be none in decoder phase.
+            input_ids = tgt_ids
+            # position_ids = tgt_pos
+            # attention_mask = (tgt_generation_mask - 1) * 1e4
+            inputs_embeds = None
+        # else:
+        #     attention_mask = (attention_mask - 1) * 1e4
+        model_inputs = {
+            "input_ids": input_ids,
+            "inputs_embeds": inputs_embeds,
+            # "position_ids": position_ids,
+            # "attention_mask": attention_mask,
+            "past_seq_len": past_seq_len,
+            "step_idx",step_idx,
+        }
+        return model_inputs
+
+    def forward(
+        self,
+        input_ids,
+        inputs_embeds=None,
+        past_seq_len=None,
+        step_idx=None,
+        output_hidden_states=None,
+        return_dict=None,
+    ):
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.llama(
+            input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            cache=cache,
+            cache_kvs=cache_kvs,
+            pre_caches=pre_caches,
+            seq_len_encoder=seq_len_encoder,
+            seq_len_decoder=seq_len_decoder,
+            past_key_values=past_key_values,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        hidden_states = outputs[0]
+        logits = self.lm_head(
+            hidden_states,
+            tensor_parallel_output=False,
+        )
+
+        loss = None
+        if labels is not None:
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :]
+            shift_labels = labels[..., 1:]
+            # Flatten the tokens
+            loss = self.criterion(shift_logits, shift_labels)
+
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
+
+        return CausalLMOutputWithCrossAttentions(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+    @paddle.no_grad()
+    def set_state_dict(self, state_dict):
+        if "lm_head.weight" in state_dict:
+            self.lm_head.weight.set_value(state_dict["lm_head.weight"])
+        self.llama.set_state_dict({k: state_dict[k] for k in state_dict.keys()})
+
 
 
 class LlamaForCausalLMInferenceModel(GenerationInferenceModel, LlamaPretrainedModel):

@@ -695,6 +695,7 @@ class StaticInferencePredictor(InferencePredictorMixin, BasePredictor):
 
         self.predictor.run()
 
+#目前要适配的cpu 动态图 predictor
 
 class DygraphInferencePredictor(InferencePredictorMixin, BasePredictor):
     def __init__(
@@ -1299,6 +1300,7 @@ def create_predictor(
         else:
             raise ValueError("the `mode` should be one of [dynamic, static]")
     else:
+        #inderence_model
         if predictor_args.mode == "dynamic":
             # TODO(wj-Mcat): complete AutoInferenceModel & AutoPredictor
             config = AutoConfig.from_pretrained(predictor_args.model_name_or_path)
@@ -1590,23 +1592,23 @@ def predict():
     batch_source_texts = batchfy_text(source_texts, predictor_args.batch_size)
     batch_target_texts = batchfy_text(target_texts, predictor_args.batch_size)
 
-    with open(model_args.output_file, "w", encoding="utf-8") as f:
-        for bs, batch_source_text in enumerate(batch_source_texts):
-            logger.info("Start predict")
-            outputs = predictor.predict(batch_source_text)
-            logger.info("End predict")
+    # with open(model_args.output_file, "w", encoding="utf-8") as f:
+    for bs, batch_source_text in enumerate(batch_source_texts):
+        logger.info("Start predict")
+        outputs = predictor.predict(batch_source_text)
+        logger.info("End predict")
 
-            if predictor.tensor_parallel_rank > 0:
-                continue
-            for output, source, target in zip(outputs, batch_source_texts[bs], batch_target_texts[bs]):
-                print("***********Source**********")
-                print(source)
-                print("***********Target**********")
-                print(target)
-                print("***********Output**********")
-                print(output)
-                out = {"src": source, "tgt": target, "output": output}
-                f.write(json.dumps(out, ensure_ascii=False) + "\n")
+        if predictor.tensor_parallel_rank > 0:
+            continue
+        for output, source, target in zip(outputs, batch_source_texts[bs], batch_target_texts[bs]):
+            print("***********Source**********")
+            print(source)
+            print("***********Target**********")
+            print(target)
+            print("***********Output**********")
+            print(output)
+            out = {"src": source, "tgt": target, "output": output}
+            f.write(json.dumps(out, ensure_ascii=False) + "\n")
 
 
 def benchmark(predictor, predictor_args, model_args):
